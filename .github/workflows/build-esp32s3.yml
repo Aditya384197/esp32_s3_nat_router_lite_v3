@@ -1,19 +1,7 @@
 name: Build ESP32-S3 NAT Router
-
-on:
-push:
-branches: ["**"]
-pull_request:
-workflow_dispatch:
-
-permissions:
-contents: read
-
-jobs:
-build:
-name: ESP32-S3 / ESP-IDF v5.5.4
-runs-on: ubuntu-latest
-
+on: push: branches: - "**" pull_request: workflow_dispatch:
+permissions: contents: read
+jobs: build: name: ESP32-S3 / ESP-IDF v5.5.4 runs-on: ubuntu-latest
 steps:
   - name: Checkout
     uses: actions/checkout@v4
@@ -30,44 +18,30 @@ steps:
     run: idf.py build
 
   - name: Merge flash image
-    run: |
-      idf.py merge-bin -o esp32s3_nat_router_merged.bin
+    run: idf.py merge-bin -o esp32s3_nat_router_merged.bin
 
   - name: Verify generated files
     run: |
       echo "===== BUILD FILES ====="
       ls -lah build/
 
-      echo "===== REQUIRED FILES ====="
       test -f build/esp32s3_nat_router.bin
       test -f build/bootloader/bootloader.bin
       test -f build/partition_table/partition-table.bin
       test -f build/esp32s3_nat_router_merged.bin
 
-      ls -lh \
-        build/esp32s3_nat_router.bin \
-        build/bootloader/bootloader.bin \
-        build/partition_table/partition-table.bin \
-        build/esp32s3_nat_router_merged.bin
-
   - name: Collect firmware
     run: |
       mkdir -p artifacts
 
-      cp build/esp32s3_nat_router.bin \
-        artifacts/esp32s3_app.bin
+      cp build/esp32s3_nat_router.bin artifacts/esp32s3_app.bin
+      cp build/bootloader/bootloader.bin artifacts/esp32s3_bootloader.bin
+      cp build/partition_table/partition-table.bin artifacts/esp32s3_partition-table.bin
+      cp build/esp32s3_nat_router_merged.bin artifacts/esp32s3_merged.bin
 
-      cp build/bootloader/bootloader.bin \
-        artifacts/esp32s3_bootloader.bin
-
-      cp build/partition_table/partition-table.bin \
-        artifacts/esp32s3_partition-table.bin
-
-      cp build/esp32s3_nat_router_merged.bin \
-        artifacts/esp32s3_merged.bin
-
-      cp build/flash_args \
-        artifacts/flash_args.txt
+      if [ -f build/flash_args ]; then
+        cp build/flash_args artifacts/flash_args.txt
+      fi
 
   - name: Upload firmware
     uses: actions/upload-artifact@v4

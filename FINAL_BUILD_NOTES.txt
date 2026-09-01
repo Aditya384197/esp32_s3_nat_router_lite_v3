@@ -4,7 +4,11 @@ Routing core: AP+STA + NAPT only.
 Management security: HTTPS-only 443, HTTP->HTTPS redirect, custom session cookies, PBKDF2-HMAC-SHA256 password records with random salt, CSRF tokens, session expiry, login throttling, restrictive response headers, no plaintext credential transport.
 Legacy credentials are migrated to salted PBKDF2 after the first successful login.
 Performance: 240MHz, Wi-Fi power-save disabled, dynamic RX/TX 64, AMPDU TX/RX, BA windows 32, TCPIP/UDP mailboxes 64, app/HTTP task on core 1 and Wi-Fi task on core 0.
-OTA: existing pending-image confirmation is retained and occurs after Wi-Fi and HTTPS management initialization.
+OTA layout: the project has `otadata`, `ota_0`, and `ota_1` partitions and
+uses ESP-IDF's pending-image confirmation/rollback path. The bootloader rollback
+option is explicitly enabled. There is currently no network firmware-upload
+OTA endpoint in the management UI, so this is OTA boot/rollback infrastructure,
+not a complete self-service OTA updater.
 TLS certificate: generated automatically at configure time with OpenSSL using ECDSA P-256; not stored in source control.
 Production hardware note: Secure Boot v2 + Flash Encryption are intentionally not eFuse-burned by CI. They require device-specific key provisioning and make reflashing materially more restrictive.
 
@@ -91,3 +95,18 @@ about this was worth asking, but no fix was needed there.
     anyone who can merely reach the page, plus an overflow-safe
     snprintf length check that was previously missing.
 
+
+
+## Flash/package validation
+
+The authoritative current flash map is:
+- `0x00000000` bootloader
+- `0x00008000` partition table
+- `0x0000F000` `ota_data_initial.bin` (8 KiB)
+- `0x00020000` application in `ota_0` (1536 KiB slot)
+
+The CI package step validates `build/flash_args`, requires the generated
+`ota_data_initial.bin`, checks bootloader/partition/app sizes against their
+regions, and creates a single recovery image at `0x00000000`. It intentionally
+does not fabricate a missing OTA initializer, because hiding that condition
+could produce a misleading firmware package.

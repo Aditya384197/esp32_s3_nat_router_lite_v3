@@ -1,0 +1,89 @@
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL=2
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_ESPPSRAM64=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_example.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_example.csv"
+CONFIG_LWIP_L2_TO_L3_COPY=y
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=16
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+# RX aggregation window was previously left at its default of 6 while
+# TX was tuned to 32 - an asymmetric config that specifically caps
+# download-side (uplink -> AP client) throughput. Match TX and take
+# advantage of the 8MB PSRAM per Espressif's own iperf reference config.
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+# Local sockets (HTTP UI) only - NAT-forwarded traffic is IP-layer
+# forwarding and is not gated by these, but the default 5760B window
+# makes the router's own web UI needlessly sluggish over a busy link.
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+# TCPIP_RECVMBOX is the queue every packet passes through before
+# ip_forward() runs - including NAT-forwarded traffic, not just local
+# sockets - so this one directly caps max forwarding rate under load.
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+# Keep the Wi-Fi driver task off the same core the app/httpd task
+# defaults to, so a busy config UI request can't stall packet forwarding.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=32
+
+CONFIG_ESP_WIFI_MBEDTLS_CRYPTO=y
+
+CONFIG_MBEDTLS_HARDWARE_AES=y
+
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+
+CONFIG_MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH=y
+
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+CONFIG_LWIP_TCPIP_TASK_PRIO=18
+
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
+
+# Task Watchdog: explicit rather than relying on ESP-IDF's own default,
+# and set to panic-on-timeout so a genuine task deadlock/hang triggers
+# a clean, automatic reset rather than a device that's silently stuck
+# forever - the single most useful reliability property for something
+# meant to run unattended 24/7. 12s is generous enough not to false-
+# trigger on legitimate slow paths (e.g. the calibrated PBKDF2 hash,
+# or a Wi-Fi scan) while still catching a real hang promptly.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=12
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y

@@ -1,0 +1,93 @@
+ESP32-S3 NAT Router Lite - hardened management / high-throughput core
+
+Routing core: AP+STA + NAPT only.
+Management security: HTTPS-only 443, HTTP->HTTPS redirect, custom session cookies, PBKDF2-HMAC-SHA256 password records with random salt, CSRF tokens, session expiry, login throttling, restrictive response headers, no plaintext credential transport.
+Legacy credentials are migrated to salted PBKDF2 after the first successful login.
+Performance: 240MHz, Wi-Fi power-save disabled, dynamic RX/TX 64, AMPDU TX/RX, BA windows 32, TCPIP/UDP mailboxes 64, app/HTTP task on core 1 and Wi-Fi task on core 0.
+OTA: existing pending-image confirmation is retained and occurs after Wi-Fi and HTTPS management initialization.
+TLS certificate: generated automatically at configure time with OpenSSL using ECDSA P-256; not stored in source control.
+Production hardware note: Secure Boot v2 + Flash Encryption are intentionally not eFuse-burned by CI. They require device-specific key provisioning and make reflashing materially more restrictive.
+
+Security architecture: HTTPS management, AP-interface-only binding, salted PBKDF2 password hashes, random session tokens, CSRF tokens, rate limiting, generic auth failures, and authenticated configuration endpoints. Secure Boot/Flash Encryption are not auto-enabled because they require deliberate per-device eFuse provisioning.
+
+--- Fixes applied on review ---
+1. Three build-breaking over-escaped JSON/HTML string literals fixed
+   (logout_handler, json_error, and four HTML attributes inside the
+   scan() network-list renderer plus the esc() regex) - verified by
+   isolating and compiling each literal standalone with gcc, and by a
+   full-file brace/paren balance sweep. The project did not compile
+   before this pass.
+2. PBKDF2 iteration count changed from a fixed 600,000 (OWASP's number
+   for a modern server CPU, ~100-300ms there) to a self-calibrated
+   count targeting ~350ms on this specific chip's actual measured
+   hashing speed (50k-300k iteration safety bounds). A fixed 600k on a
+   240MHz MCU would very likely have meant several seconds of freeze
+   on every login. The calibrated count is stored per-credential
+   (admin_iters) so verification always replays the exact count used
+   to create that hash.
+3. Live status (uplink/IP/RSSI/uptime/data/clients/AP name) is now
+   also shown inside the post-login "secure" panel - previously it
+   was only on the pre-login screen, so there was no way to see
+   whether a newly saved uplink actually connected without logging
+   back out first.
+4. Rate-limit lockout now keeps escalating (doubling, capped at 5
+   minutes) for sustained failures past the initial block threshold,
+   instead of resetting to a flat 60 seconds indefinitely.
+
+--- Fixes applied from the second (ChatGPT) review pass ---
+5. OTA image is now confirmed valid right after the core routing
+   stack (NVS + Wi-Fi + AP/STA) comes up, BEFORE the HTTPS/HTTP
+   servers start - previously it was confirmed after the web server
+   started, so a crash in that (non-critical) layer could trigger an
+   unwanted rollback of otherwise-good firmware.
+6. NVS corruption/version-mismatch recovery (which wipes ALL saved
+   settings) is now logged clearly instead of happening silently.
+7. Free/minimum-free internal heap and free PSRAM are back in
+   /api/status and shown on both the pre- and post-login dashboards -
+   the single most useful signal for catching a slow leak before it
+   becomes a 24/7 outage.
+8. Client-side esc() now also escapes apostrophes, for defense in
+   depth alongside the existing &, <, >, " handling.
+9. Task Watchdog is now explicitly configured (12s, panic-on-timeout)
+   rather than left to ESP-IDF's own default, so a genuine task
+   deadlock triggers a clean automatic reset.
+10. A lightweight heap-health watchdog task now runs alongside TWDT -
+    TWDT catches hangs/deadlocks, but a slow memory leak never
+    technically "hangs" anything, so this is a separate check: after
+    internal free heap stays critically low for a sustained period
+    (not a single transient dip), it performs a controlled restart
+    rather than limping toward an eventual allocation failure.
+11. A boot-time log warning now fires if the Access Point Wi-Fi has
+    no password (open network) - the default is left open (changing
+    that would risk locking the owner out of a freshly flashed
+    device with no way to discover a generated password), but the
+    risk is now visible in the logs rather than silent.
+
+Session absolute-lifetime (8h) and idle-timeout (15min) were already
+correctly enforced (session_auth checks both) - the review's question
+about this was worth asking, but no fix was needed there.
+
+--- Critical fix: missing captive portal implementation ---
+12. captive_portal_start()/captive_portal_stop() were declared and
+    CALLED (from esp32_nat_router.c) but had no function body anywhere
+    in http_server.c - this would have failed at the final link step
+    ("undefined reference to captive_portal_start"). The full
+    implementation (a proper multi-question DNS parser, not just a
+    single-question one) has been added, along with the missing
+    captive_portal_stop() declaration in http_server.h and an actual
+    call to it on IP_EVENT_STA_GOT_IP (previously nothing ever told
+    the DNS hijack to stop once started, so it would have kept
+    intercepting port 53 for all AP clients forever, even after the
+    uplink reconnected).
+13. That implementation had a real stack buffer overflow: the bounds
+    check before appending a 16-byte DNS answer record only rejected
+    question sections over 512 bytes, not over 496 - a crafted query
+    with a 497-512 byte question section would write up to 16 bytes
+    past the end of the 512-byte response[] stack buffer. Fixed to
+    reject anything that wouldn't leave room for the appended record.
+14. status_handler now gates heap/PSRAM memory stats behind
+    authentication (only visible once signed in) - a reasonable
+    defense-in-depth tightening over exposing internal memory state to
+    anyone who can merely reach the page, plus an overflow-safe
+    snprintf length check that was previously missing.
+

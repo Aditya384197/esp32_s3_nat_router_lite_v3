@@ -1,0 +1,87 @@
+ESP32-S3 NAT Router Lite v3 — VERIFIED FLASH LAYOUT
+
+Target: ESP32-S3, 16 MB flash
+ESP-IDF: v5.5.4
+
+IMPORTANT:
+This project uses an OTA partition layout without a factory app. Therefore
+main application firmware is NOT flashed at 0x10000. The active first OTA
+slot (ota_0) starts at 0x20000.
+
+INDIVIDUAL FILE FLASHING
+
+1) Bootloader
+   File: esp32s3_bootloader.bin
+   Address: 0x00000000
+
+2) Partition table
+   File: esp32s3_partition-table.bin
+   Address: 0x00008000
+
+3) OTA data initializer
+   File: ota_data_initial.bin
+   Address: 0x0000F000
+
+4) Main application
+   File: esp32s3_app.bin
+   Address: 0x00020000
+
+These four entries are the authoritative manual-flash layout.
+Do not move the application to 0x10000.
+
+RECOMMENDED METHOD
+
+Use esp32s3_nat_router_factory.bin as a single factory/recovery image at:
+   0x00000000
+
+This image was assembled from the exact four entries above, with unused
+address gaps left erased (0xFF).
+
+WHY ota_data_initial.bin EXISTS
+
+The partition table contains:
+   otadata, data, ota, 0xF000, 8K
+   ota_0,   app,  ota_0, 0x20000, 1536K
+   ota_1,   app,  ota_1, (auto), 1536K
+
+ESP-IDF generates build/ota_data_initial.bin automatically for the OTA data
+partition. The initial file represents an erased OTA-data partition so the
+bootloader can select the first available OTA application slot.
+
+Do not replace this file with the application binary, partition-table binary,
+or an arbitrary file. If the CI build does not contain ota_data_initial.bin,
+the build/package must be treated as failed rather than inventing the file.
+
+ESP-IDF COMMAND-LINE FLASH
+
+The safest reproducible command is to run idf.py flash from the same project
+build produced by CI. Its generated build/flash_args file is authoritative.
+
+MANUAL esptool LAYOUT
+
+Bootloader:
+  0x00000000 esp32s3_bootloader.bin
+Partition table:
+  0x00008000 esp32s3_partition-table.bin
+OTA data:
+  0x0000F000 ota_data_initial.bin
+Application:
+  0x00020000 esp32s3_app.bin
+
+AFTER FLASHING
+
+1) Reset the ESP32-S3.
+2) Open the serial monitor at 115200 baud.
+3) The boot log should identify the custom partition table and boot an
+   application from ota_0.
+4) If the device still reports checksum/magic/"No bootable app partitions"
+   errors, erase the full flash once and repeat the verified four-image
+   sequence above. Do not change any offsets.
+
+NOTE ABOUT OTA FEATURE
+
+The firmware contains OTA partition/rollback support (including the OTA
+validation API and app_update component), but it does NOT currently expose a
+complete network firmware-upload/update endpoint. The OTA data partition is
+therefore required by the current partition architecture, while an actual OTA
+update operation is not part of the current management UI.

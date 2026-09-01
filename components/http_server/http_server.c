@@ -7,7 +7,6 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <net/if.h>
 #include <errno.h>
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -122,6 +121,34 @@ static uint32_t peer_ip(httpd_req_t *req){int fd=httpd_req_to_sockfd(req);struct
 static bool cookie_get(httpd_req_t *req,const char *name,char *out,size_t cap){char h[192];if(httpd_req_get_hdr_value_str(req,"Cookie",h,sizeof(h))!=ESP_OK)return false;size_t nl=strlen(name);char *p=h;while(p){while(*p==' ')p++;if(strncmp(p,name,nl)==0&&p[nl]=='='){p+=nl+1;char *e=strchr(p,';');size_t n=e?(size_t)(e-p):strlen(p);if(n>=cap)return false;memcpy(out,p,n);out[n]=0;return true;}p=strchr(p,';');if(p)p++;}return false;}
 static bool session_auth(httpd_req_t *req,uint8_t csrf[AUTH_CSRF_BYTES],char *user,size_t user_cap){char c[65];uint8_t tok[AUTH_TOKEN_BYTES];uint32_t ip=peer_ip(req);if(!cookie_get(req,"__Host-session",c,sizeof(c))||strlen(c)!=64||!hex_decode(c,tok,sizeof(tok)))return false;int64_t now=esp_timer_get_time();bool ok=false;portENTER_CRITICAL(&auth_mux);for(int i=0;i<AUTH_SESSION_MAX;i++){if(sessions[i].used&&sessions[i].ip==ip&&ct_bytes(tok,sessions[i].token,sizeof(tok))){if(now-sessions[i].last_use_us<=AUTH_IDLE_US&&now-sessions[i].created_us<=AUTH_ABSOLUTE_US){sessions[i].last_use_us=now;memcpy(csrf,sessions[i].csrf,sizeof(sessions[i].csrf));strlcpy(user,sessions[i].user,user_cap);ok=true;}else{memset(&sessions[i],0,sizeof(sessions[i]));}}}portEXIT_CRITICAL(&auth_mux);memset(tok,0,sizeof(tok));return ok;}
 static bool csrf_ok(httpd_req_t *req,const uint8_t expected[AUTH_CSRF_BYTES]){char h[40];uint8_t got[AUTH_CSRF_BYTES];if(httpd_req_get_hdr_value_str(req,"X-CSRF-Token",h,sizeof(h))!=ESP_OK||strlen(h)!=32||!hex_decode(h,got,sizeof(got)))return false;bool ok=ct_bytes(got,expected,sizeof(got));memset(got,0,sizeof(got));return ok;}
+/* ESP-IDF v5.5.4's httpd_config_t has no if_name field to bind the
+ * listen socket to a single interface (this IDF version's build broke
+ * on that field entirely - it does not exist here), so the "AP-only,
+ * never reachable over the STA/uplink side" property that was meant
+ * to provide is instead enforced per-request: getsockname() gives the
+ * LOCAL address the connection actually arrived on, and only the AP's
+ * own IP is accepted. A request that arrived via the STA interface
+ * (e.g. from another device sharing the same upstream Wi-Fi this
+ * router uses as its uplink) is rejected here before reaching any
+ * handler logic. */
+static bool request_via_ap_interface(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return false;
+    struct sockaddr_in local = {0};
+    socklen_t len = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &len) != 0) return false;
+    return local.sin_addr.s_addr == my_ap_ip;
+}
+
+static esp_err_t forbidden_wrong_interface(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":false,\"message\":\"Not available on this interface\"}");
+    return ESP_OK;
+}
+
 static bool origin_ok(httpd_req_t *req){char h[160];if(httpd_req_get_hdr_value_str(req,"Origin",h,sizeof(h))!=ESP_OK)return true;return strcmp(h,"https://192.168.4.1")==0||strcmp(h,"https://router.local")==0;}
 static bool rate_allowed(uint32_t ip){int64_t now=esp_timer_get_time();bool ok=true;portENTER_CRITICAL(&auth_mux);for(int i=0;i<AUTH_FAIL_SLOTS;i++){if(rate_slots[i].used&&rate_slots[i].ip==ip){ok=!(now<rate_slots[i].blocked_until_us||now<rate_slots[i].next_allowed_us);break;}}portEXIT_CRITICAL(&auth_mux);return ok;}
 static void rate_failure(uint32_t ip){int64_t now=esp_timer_get_time();portENTER_CRITICAL(&auth_mux);int slot=-1;for(int i=0;i<AUTH_FAIL_SLOTS;i++)if(rate_slots[i].used&&rate_slots[i].ip==ip){slot=i;break;}if(slot<0){for(int i=0;i<AUTH_FAIL_SLOTS;i++)if(!rate_slots[i].used){slot=i;break;}if(slot<0)slot=0;memset(&rate_slots[slot],0,sizeof(rate_slots[slot]));rate_slots[slot].used=true;rate_slots[slot].ip=ip;}if(rate_slots[slot].fails<UINT16_MAX)rate_slots[slot].fails++;uint32_t e=rate_slots[slot].fails>5?5:rate_slots[slot].fails;rate_slots[slot].next_allowed_us=now+((int64_t)250000<<e);if(rate_slots[slot].fails>=AUTH_BLOCK_AFTER){uint32_t over=rate_slots[slot].fails-AUTH_BLOCK_AFTER;uint32_t shift=over>6?6:over;int64_t escalated=AUTH_BLOCK_US<<shift;if(escalated>AUTH_BLOCK_MAX_US||escalated<0)escalated=AUTH_BLOCK_MAX_US;rate_slots[slot].blocked_until_us=now+escalated;}portEXIT_CRITICAL(&auth_mux);}
@@ -133,9 +160,9 @@ static size_t json_escape_local(const char *in,char *out,size_t cap){size_t w=0;
 static void security_headers(httpd_req_t *req){httpd_resp_set_hdr(req,"Cache-Control","no-store");httpd_resp_set_hdr(req,"X-Content-Type-Options","nosniff");httpd_resp_set_hdr(req,"X-Frame-Options","DENY");httpd_resp_set_hdr(req,"Referrer-Policy","no-referrer");httpd_resp_set_hdr(req,"Permissions-Policy","camera=(),microphone=(),geolocation=()");httpd_resp_set_hdr(req,"Cross-Origin-Resource-Policy","same-origin");httpd_resp_set_hdr(req,"Cross-Origin-Opener-Policy","same-origin");httpd_resp_set_hdr(req,"Content-Security-Policy","default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");httpd_resp_set_hdr(req,"Strict-Transport-Security","max-age=31536000; includeSubDomains");}
 static void json_error(httpd_req_t *req,const char *status,const char *msg){char b[192];snprintf(b,sizeof(b),"{\"ok\":false,\"message\":\"%s\"}",msg);security_headers(req);httpd_resp_set_type(req,"application/json");httpd_resp_set_status(req,status);httpd_resp_sendstr(req,b);}
 
-static esp_err_t index_handler(httpd_req_t *req){security_headers(req);httpd_resp_set_type(req,"text/html; charset=utf-8");return httpd_resp_send(req,INDEX_HTML,HTTPD_RESP_USE_STRLEN);}
-static esp_err_t status_handler(httpd_req_t *req){char uptime[32];format_uptime(get_uptime_seconds(),uptime,sizeof(uptime));char ipbuf[16]="-";wifi_ap_record_t ap={0};int rssi=0;if(esp_wifi_sta_get_ap_info(&ap)==ESP_OK)rssi=ap.rssi;if(ap_connect)ip4addr_ntoa_r((const ip4_addr_t*)&my_ip,ipbuf,sizeof(ipbuf));wifi_config_lock();char apbuf[200];json_escape_local(ap_ssid,apbuf,sizeof(apbuf));wifi_config_unlock();uint32_t heap_free=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024);uint32_t heap_min=(uint32_t)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)/1024);uint32_t psram_free=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);char out[640];snprintf(out,sizeof(out),"{\"uplink\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime\":\"%s\",\"rx\":\"%.2f MB\",\"tx\":\"%.2f MB\",\"clients\":%u,\"ap_ssid\":\"%s\",\"heap_free_kb\":%lu,\"heap_min_kb\":%lu,\"psram_free_kb\":%lu}",ap_connect?"Connected":"Disconnected",ipbuf,rssi,uptime,(double)get_sta_bytes_received()/1048576.0,(double)get_sta_bytes_sent()/1048576.0,connect_count,apbuf,(unsigned long)heap_free,(unsigned long)heap_min,(unsigned long)psram_free);security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,out);}
-static esp_err_t auth_state_handler(httpd_req_t *req){char user[33]="",ue[129]="",ch[33]="";uint8_t csrf[AUTH_CSRF_BYTES];bool ok=session_auth(req,csrf,user,sizeof(user));if(ok){hex_encode(csrf,sizeof(csrf),ch);json_escape_local(user,ue,sizeof(ue));}wifi_config_lock();bool configured=admin_pass&&admin_pass[0];wifi_config_unlock();char out[240];snprintf(out,sizeof(out),"{\"authenticated\":%s,\"configured\":%s,\"user\":\"%s\",\"csrf\":\"%s\"}",ok?"true":"false",configured?"true":"false",ue,ch);security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,out);}
+static esp_err_t index_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);security_headers(req);httpd_resp_set_type(req,"text/html; charset=utf-8");return httpd_resp_send(req,INDEX_HTML,HTTPD_RESP_USE_STRLEN);}
+static esp_err_t status_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);char uptime[32];format_uptime(get_uptime_seconds(),uptime,sizeof(uptime));char ipbuf[16]="-";wifi_ap_record_t ap={0};int rssi=0;if(esp_wifi_sta_get_ap_info(&ap)==ESP_OK)rssi=ap.rssi;if(ap_connect)ip4addr_ntoa_r((const ip4_addr_t*)&my_ip,ipbuf,sizeof(ipbuf));wifi_config_lock();char apbuf[200];json_escape_local(ap_ssid,apbuf,sizeof(apbuf));wifi_config_unlock();uint32_t heap_free=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024);uint32_t heap_min=(uint32_t)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)/1024);uint32_t psram_free=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);char out[640];snprintf(out,sizeof(out),"{\"uplink\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"uptime\":\"%s\",\"rx\":\"%.2f MB\",\"tx\":\"%.2f MB\",\"clients\":%u,\"ap_ssid\":\"%s\",\"heap_free_kb\":%lu,\"heap_min_kb\":%lu,\"psram_free_kb\":%lu}",ap_connect?"Connected":"Disconnected",ipbuf,rssi,uptime,(double)get_sta_bytes_received()/1048576.0,(double)get_sta_bytes_sent()/1048576.0,connect_count,apbuf,(unsigned long)heap_free,(unsigned long)heap_min,(unsigned long)psram_free);security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,out);}
+static esp_err_t auth_state_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);char user[33]="",ue[129]="",ch[33]="";uint8_t csrf[AUTH_CSRF_BYTES];bool ok=session_auth(req,csrf,user,sizeof(user));if(ok){hex_encode(csrf,sizeof(csrf),ch);json_escape_local(user,ue,sizeof(ue));}wifi_config_lock();bool configured=admin_pass&&admin_pass[0];wifi_config_unlock();char out[240];snprintf(out,sizeof(out),"{\"authenticated\":%s,\"configured\":%s,\"user\":\"%s\",\"csrf\":\"%s\"}",ok?"true":"false",configured?"true":"false",ue,ch);security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,out);}
 static int session_slot(void){int free_slot=-1;for(int i=0;i<AUTH_SESSION_MAX;i++)if(!sessions[i].used){free_slot=i;break;}if(free_slot>=0)return free_slot;int oldest=0;for(int i=1;i<AUTH_SESSION_MAX;i++)if(sessions[i].last_use_us<sessions[oldest].last_use_us)oldest=i;return oldest;}
 static esp_err_t issue_session(httpd_req_t *req,const char *user){uint8_t tok[AUTH_TOKEN_BYTES],csrf[AUTH_CSRF_BYTES];esp_fill_random(tok,sizeof(tok));esp_fill_random(csrf,sizeof(csrf));char th[65],ch[33],ue[129];uint32_t ip=peer_ip(req);hex_encode(tok,sizeof(tok),th);hex_encode(csrf,sizeof(csrf),ch);json_escape_local(user,ue,sizeof(ue));int64_t now=esp_timer_get_time();portENTER_CRITICAL(&auth_mux);int i=session_slot();memset(&sessions[i],0,sizeof(sessions[i]));sessions[i].used=true;sessions[i].ip=ip;sessions[i].created_us=now;sessions[i].last_use_us=now;memcpy(sessions[i].token,tok,sizeof(tok));memcpy(sessions[i].csrf,csrf,sizeof(csrf));strlcpy(sessions[i].user,user,sizeof(sessions[i].user));portEXIT_CRITICAL(&auth_mux);char cookie[150];snprintf(cookie,sizeof(cookie),"__Host-session=%s; HttpOnly; Secure; SameSite=Strict; Max-Age=900; Path=/",th);httpd_resp_set_hdr(req,"Set-Cookie",cookie);char out[240];snprintf(out,sizeof(out),"{\"ok\":true,\"user\":\"%s\",\"csrf\":\"%s\"}",ue,ch);security_headers(req);httpd_resp_set_type(req,"application/json");memset(tok,0,sizeof(tok));memset(csrf,0,sizeof(csrf));return httpd_resp_sendstr(req,out);}
 static bool verify_admin(const char *user,const char *pw){wifi_config_lock();char u[33],salthex[33],stored[65];uint32_t iters;strlcpy(u,admin_user?admin_user:"",sizeof(u));strlcpy(salthex,admin_salt?admin_salt:"",sizeof(salthex));strlcpy(stored,admin_pass?admin_pass:"",sizeof(stored));iters=admin_iters;wifi_config_unlock();if(!stored[0])return false;bool user_ok=(strlen(u)==strlen(user))&&ct_bytes((const uint8_t*)u,(const uint8_t*)user,strlen(u));if(strlen(salthex)==32&&strlen(stored)==64&&iters>0){uint8_t salt[16],expect[32],have[32];bool decoded=false,hash_ok=false;if(auth_hash_acquire()){decoded=hex_decode(salthex,salt,sizeof(salt))&&hex_decode(stored,have,sizeof(have));if(decoded&&pbkdf2_sha256(pw,salt,sizeof(salt),expect,iters))hash_ok=ct_bytes(expect,have,sizeof(have));auth_hash_release();}memset(salt,0,sizeof(salt));memset(expect,0,sizeof(expect));memset(have,0,sizeof(have));return user_ok&&hash_ok;}size_t n=strlen(pw),m=strlen(stored);return user_ok&&n==m&&ct_bytes((const uint8_t*)pw,(const uint8_t*)stored,n);}
@@ -156,7 +183,7 @@ static void bootstrap_release(void)
 }
 
 static esp_err_t login_handler(httpd_req_t *req)
-{
+{if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);
     uint32_t ip=peer_ip(req);
     if(!origin_ok(req)){json_error(req,"403 Forbidden","Request rejected");return ESP_OK;}
     if(!rate_allowed(ip)){json_error(req,"429 Too Many Requests","Try again later");return ESP_OK;}
@@ -191,7 +218,7 @@ static esp_err_t login_handler(httpd_req_t *req)
 }
 static bool require_session(httpd_req_t *req,bool need_csrf){uint8_t c[16];char user[33];if(!session_auth(req,c,user,sizeof(user))){json_error(req,"401 Unauthorized","Authentication required");return false;}if(need_csrf&&!csrf_ok(req,c)){json_error(req,"403 Forbidden","Request rejected");return false;}return true;}
 static esp_err_t logout_handler(httpd_req_t *req)
-{
+{if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);
     if(!origin_ok(req)){json_error(req,"403 Forbidden","Request rejected");return ESP_OK;}
     uint8_t csrf_value[AUTH_CSRF_BYTES];
     char user[33];
@@ -207,7 +234,7 @@ static esp_err_t logout_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req,"{\"ok\":true}");
 }
 static esp_err_t setup_handler(httpd_req_t *req)
-{
+{if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);
     if(!origin_ok(req))return ESP_OK;
     if(!require_session(req,true))return ESP_OK;
     char u[33],p[64];
@@ -220,10 +247,10 @@ static esp_err_t setup_handler(httpd_req_t *req)
     portENTER_CRITICAL(&auth_mux);memset(sessions,0,sizeof(sessions));portEXIT_CRITICAL(&auth_mux);
     return issue_session(req,u);
 }
-static esp_err_t connect_handler(httpd_req_t *req){if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;if(wifi_scan_is_active()){json_error(req,"409 Conflict","Wi-Fi scan is running");return ESP_OK;}char s[33],p[64];if(!read_form(req,"ssid",s,sizeof(s),"pass",p,sizeof(p))||wifi_config_save_sta(s,p)!=ESP_OK){json_error(req,"400 Bad Request","Invalid Wi-Fi settings");return ESP_OK;}router_reconnect_uplink();security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,"{\"ok\":true,\"message\":\"Uplink saved; connecting...\"}");}
+static esp_err_t connect_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;if(wifi_scan_is_active()){json_error(req,"409 Conflict","Wi-Fi scan is running");return ESP_OK;}char s[33],p[64];if(!read_form(req,"ssid",s,sizeof(s),"pass",p,sizeof(p))||wifi_config_save_sta(s,p)!=ESP_OK){json_error(req,"400 Bad Request","Invalid Wi-Fi settings");return ESP_OK;}router_reconnect_uplink();security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,"{\"ok\":true,\"message\":\"Uplink saved; connecting...\"}");}
 static void apply_ap_task(void *arg){(void)arg;for(;;){vTaskDelay(pdMS_TO_TICKS(1000));esp_err_t e=router_apply_ap_config();if(e!=ESP_OK)ESP_LOGE(TAG,"AP apply failed: %s",esp_err_to_name(e));portENTER_CRITICAL(&ap_apply_mux);if(ap_apply_dirty){ap_apply_dirty=false;portEXIT_CRITICAL(&ap_apply_mux);continue;}ap_apply_pending=false;portEXIT_CRITICAL(&ap_apply_mux);break;}vTaskDelete(NULL);}
-static esp_err_t ap_handler(httpd_req_t *req){if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;char s[33],p[64];if(!read_form(req,"ssid",s,sizeof(s),"pass",p,sizeof(p))||wifi_config_save_ap(s,p)!=ESP_OK){json_error(req,"400 Bad Request","Invalid AP settings");return ESP_OK;}bool make=false;portENTER_CRITICAL(&ap_apply_mux);if(ap_apply_pending)ap_apply_dirty=true;else{ap_apply_pending=true;make=true;}portEXIT_CRITICAL(&ap_apply_mux);if(make&&xTaskCreate(apply_ap_task,"apply_ap",3072,NULL,4,NULL)!=pdPASS){portENTER_CRITICAL(&ap_apply_mux);ap_apply_pending=false;ap_apply_dirty=false;portEXIT_CRITICAL(&ap_apply_mux);json_error(req,"500 Internal Server Error","AP settings saved but could not be applied");return ESP_OK;}security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,"{\"ok\":true,\"message\":\"AP settings saved; reconnect with the new AP credentials\"}");}
-static esp_err_t scan_handler(httpd_req_t *req){if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;if(!wifi_scan_try_begin()){json_error(req,"409 Conflict","Scan already running");return ESP_OK;}wifi_scan_config_t cfg={0};cfg.show_hidden=true;cfg.scan_type=WIFI_SCAN_TYPE_ACTIVE;cfg.scan_time.active.min=100;cfg.scan_time.active.max=250;esp_err_t e=esp_wifi_scan_start(&cfg,true);if(e!=ESP_OK){wifi_scan_end();json_error(req,"500 Internal Server Error","Wi-Fi scan failed");return ESP_OK;}uint16_t count=0;esp_wifi_scan_get_ap_num(&count);if(count>32)count=32;wifi_ap_record_t *list=count?calloc(count,sizeof(*list)):NULL;if(count&&!list){wifi_scan_end();json_error(req,"500 Internal Server Error","Out of memory");return ESP_OK;}if(count)esp_wifi_scan_get_ap_records(&count,list);char *out=malloc(4096);if(!out){free(list);wifi_scan_end();json_error(req,"500 Internal Server Error","Out of memory");return ESP_OK;}size_t pos=(size_t)snprintf(out,4096,"{\"networks\":[");bool first=true;for(uint16_t i=0;i<count&&pos<3900;i++){if(list[i].ssid[0]==0){int n=snprintf(out+pos,4096-pos,"%s{\"ssid\":\"\",\"rssi\":%d,\"hidden\":true}",first?"":",",list[i].rssi);if(n<0||(size_t)n>=4096-pos)break;pos+=n;first=false;continue;}char esc[200];json_escape_local((const char*)list[i].ssid,esc,sizeof(esc));int n=snprintf(out+pos,4096-pos,"%s{\"ssid\":\"%s\",\"rssi\":%d,\"hidden\":false}",first?"":",",esc,list[i].rssi);if(n<0||(size_t)n>=4096-pos)break;pos+=n;first=false;}snprintf(out+pos,4096-pos,"]}");free(list);wifi_scan_end();security_headers(req);httpd_resp_set_type(req,"application/json");e=httpd_resp_send(req,out,HTTPD_RESP_USE_STRLEN);free(out);return e;}
+static esp_err_t ap_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;char s[33],p[64];if(!read_form(req,"ssid",s,sizeof(s),"pass",p,sizeof(p))||wifi_config_save_ap(s,p)!=ESP_OK){json_error(req,"400 Bad Request","Invalid AP settings");return ESP_OK;}bool make=false;portENTER_CRITICAL(&ap_apply_mux);if(ap_apply_pending)ap_apply_dirty=true;else{ap_apply_pending=true;make=true;}portEXIT_CRITICAL(&ap_apply_mux);if(make&&xTaskCreate(apply_ap_task,"apply_ap",3072,NULL,4,NULL)!=pdPASS){portENTER_CRITICAL(&ap_apply_mux);ap_apply_pending=false;ap_apply_dirty=false;portEXIT_CRITICAL(&ap_apply_mux);json_error(req,"500 Internal Server Error","AP settings saved but could not be applied");return ESP_OK;}security_headers(req);httpd_resp_set_type(req,"application/json");return httpd_resp_sendstr(req,"{\"ok\":true,\"message\":\"AP settings saved; reconnect with the new AP credentials\"}");}
+static esp_err_t scan_handler(httpd_req_t *req){if(!request_via_ap_interface(req))return forbidden_wrong_interface(req);if(!origin_ok(req))return ESP_OK;if(!require_session(req,true))return ESP_OK;if(!wifi_scan_try_begin()){json_error(req,"409 Conflict","Scan already running");return ESP_OK;}wifi_scan_config_t cfg={0};cfg.show_hidden=true;cfg.scan_type=WIFI_SCAN_TYPE_ACTIVE;cfg.scan_time.active.min=100;cfg.scan_time.active.max=250;esp_err_t e=esp_wifi_scan_start(&cfg,true);if(e!=ESP_OK){wifi_scan_end();json_error(req,"500 Internal Server Error","Wi-Fi scan failed");return ESP_OK;}uint16_t count=0;esp_wifi_scan_get_ap_num(&count);if(count>32)count=32;wifi_ap_record_t *list=count?calloc(count,sizeof(*list)):NULL;if(count&&!list){wifi_scan_end();json_error(req,"500 Internal Server Error","Out of memory");return ESP_OK;}if(count)esp_wifi_scan_get_ap_records(&count,list);char *out=malloc(4096);if(!out){free(list);wifi_scan_end();json_error(req,"500 Internal Server Error","Out of memory");return ESP_OK;}size_t pos=(size_t)snprintf(out,4096,"{\"networks\":[");bool first=true;for(uint16_t i=0;i<count&&pos<3900;i++){if(list[i].ssid[0]==0){int n=snprintf(out+pos,4096-pos,"%s{\"ssid\":\"\",\"rssi\":%d,\"hidden\":true}",first?"":",",list[i].rssi);if(n<0||(size_t)n>=4096-pos)break;pos+=n;first=false;continue;}char esc[200];json_escape_local((const char*)list[i].ssid,esc,sizeof(esc));int n=snprintf(out+pos,4096-pos,"%s{\"ssid\":\"%s\",\"rssi\":%d,\"hidden\":false}",first?"":",",esc,list[i].rssi);if(n<0||(size_t)n>=4096-pos)break;pos+=n;first=false;}snprintf(out+pos,4096-pos,"]}");free(list);wifi_scan_end();security_headers(req);httpd_resp_set_type(req,"application/json");e=httpd_resp_send(req,out,HTTPD_RESP_USE_STRLEN);free(out);return e;}
 static esp_err_t redirect_http(httpd_req_t *req){httpd_resp_set_status(req,"308 Permanent Redirect");httpd_resp_set_hdr(req,"Location","https://192.168.4.1/");httpd_resp_set_type(req,"text/plain");return httpd_resp_sendstr(req,"Use HTTPS");}
 static TaskHandle_t dns_task_handle = NULL;
 
@@ -388,7 +415,7 @@ void captive_portal_stop(void)
     dns_task_handle = NULL;
 }
 
-static httpd_handle_t start_http_redirect(void){httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=80;c.max_uri_handlers=1;c.max_open_sockets=2;struct ifreq ifr={0};strncpy(ifr.ifr_name,"WIFI_AP_DEF",sizeof(ifr.ifr_name)-1);c.if_name=&ifr;c.task_priority=tskIDLE_PRIORITY+1;c.core_id=1;c.stack_size=4096;httpd_handle_t h=NULL;if(httpd_start(&h,&c)!=ESP_OK)return NULL;httpd_uri_t u={.uri="/*",.method=HTTP_GET,.handler=redirect_http};c.uri_match_fn=httpd_uri_match_wildcard;if(httpd_register_uri_handler(h,&u)!=ESP_OK){httpd_stop(h);return NULL;}return h;}
+static httpd_handle_t start_http_redirect(void){httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=80;c.max_uri_handlers=1;c.max_open_sockets=2;c.task_priority=tskIDLE_PRIORITY+1;c.core_id=1;c.stack_size=4096;c.uri_match_fn=httpd_uri_match_wildcard;httpd_handle_t h=NULL;if(httpd_start(&h,&c)!=ESP_OK)return NULL;httpd_uri_t u={.uri="/*",.method=HTTP_GET,.handler=redirect_http};if(httpd_register_uri_handler(h,&u)!=ESP_OK){httpd_stop(h);return NULL;}return h;}
 
 httpd_handle_t start_webserver(uint16_t port)
 {
@@ -409,9 +436,6 @@ httpd_handle_t start_webserver(uint16_t port)
     c.httpd.stack_size = 8192;
     c.httpd.max_open_sockets = 4;
     c.httpd.max_uri_handlers = 10;
-    struct ifreq ifr = {0};
-    strncpy(ifr.ifr_name, "WIFI_AP_DEF", sizeof(ifr.ifr_name) - 1);
-    c.httpd.if_name = &ifr;
     c.httpd.lru_purge_enable = true;
     c.httpd.recv_wait_timeout = 5;
     c.httpd.send_wait_timeout = 5;

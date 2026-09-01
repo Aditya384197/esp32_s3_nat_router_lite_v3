@@ -1,54 +1,77 @@
 name: Build ESP32-S3 NAT Router
 
 on:
-  push:
-    branches: ["**"]
-  pull_request:
-  workflow_dispatch:
+push:
+branches: ["**"]
+pull_request:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  build:
-    name: ESP32-S3 / ESP-IDF v5.5.4
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+build:
+name: ESP32-S3 / ESP-IDF v5.5.4
+runs-on: ubuntu-latest
 
-      - name: Install ESP-IDF
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          version: v5.5.4
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-      - name: Set target
-        run: idf.py set-target esp32s3
+  - name: Install ESP-IDF
+    uses: espressif/install-esp-idf-action@v1
+    with:
+      version: v5.5.4
 
-      - name: Build
-        run: idf.py build
+  - name: Set target
+    run: idf.py set-target esp32s3
 
-      - name: Merge flash image
-        # merge-bin's -o path resolves relative to the CWD idf.py was
-        # invoked from (project root), NOT automatically inside build/,
-        # even though the *default* (no -o) output does land in build/.
-        # Giving it "build/esp32s3_nat_router_merged.bin" explicitly is
-        # what actually makes the following cp step find the file.
-        run: idf.py merge-bin -o build/esp32s3_nat_router_merged.bin
+  - name: Build firmware
+    run: idf.py build
 
-      - name: Collect firmware
-        run: |
-          mkdir -p artifacts
-          ls -la build/*.bin
-          cp build/esp32s3_nat_router.bin artifacts/esp32s3_app.bin
-          cp build/bootloader/bootloader.bin artifacts/esp32s3_bootloader.bin
-          cp build/partition_table/partition-table.bin artifacts/esp32s3_partition-table.bin
-          cp build/esp32s3_nat_router_merged.bin artifacts/esp32s3_merged.bin
-          cp build/flash_args artifacts/flash_args.txt
+  - name: Merge flash image
+    run: |
+      idf.py merge-bin -o esp32s3_nat_router_merged.bin
 
-      - name: Upload firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32s3-nat-router
-          path: artifacts/
-          if-no-files-found: error
+  - name: Verify generated files
+    run: |
+      echo "===== BUILD FILES ====="
+      ls -lah build/
+
+      echo "===== REQUIRED FILES ====="
+      test -f build/esp32s3_nat_router.bin
+      test -f build/bootloader/bootloader.bin
+      test -f build/partition_table/partition-table.bin
+      test -f build/esp32s3_nat_router_merged.bin
+
+      ls -lh \
+        build/esp32s3_nat_router.bin \
+        build/bootloader/bootloader.bin \
+        build/partition_table/partition-table.bin \
+        build/esp32s3_nat_router_merged.bin
+
+  - name: Collect firmware
+    run: |
+      mkdir -p artifacts
+
+      cp build/esp32s3_nat_router.bin \
+        artifacts/esp32s3_app.bin
+
+      cp build/bootloader/bootloader.bin \
+        artifacts/esp32s3_bootloader.bin
+
+      cp build/partition_table/partition-table.bin \
+        artifacts/esp32s3_partition-table.bin
+
+      cp build/esp32s3_nat_router_merged.bin \
+        artifacts/esp32s3_merged.bin
+
+      cp build/flash_args \
+        artifacts/flash_args.txt
+
+  - name: Upload firmware
+    uses: actions/upload-artifact@v4
+    with:
+      name: esp32s3-nat-router
+      path: artifacts/
+      if-no-files-found: error

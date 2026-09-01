@@ -1,53 +1,68 @@
 name: Build ESP32-S3 NAT Router
+on: push: branches: ["**"] pull_request: workflow_dispatch:
+permissions: contents: read
+jobs: build: name: ESP32-S3 / ESP-IDF v5.5.4 runs-on: ubuntu-latest
+# Official ESP-IDF image.
+# ESP-IDF and toolchain are already installed inside this image.
+container:
+  image: espressif/idf:v5.5.4
 
-on:
-  push:
-    branches: ["**"]
-  pull_request:
-  workflow_dispatch:
+steps:
+  - name: Checkout source
+    uses: actions/checkout@v4
 
-permissions:
-  contents: read
+  - name: Build and package firmware
+    shell: bash
+    run: |
+      set -euo pipefail
 
-jobs:
-  build:
-    name: ESP32-S3 / ESP-IDF v5.5.4
-    runs-on: ubuntu-latest
+      echo "========================================"
+      echo "Loading pre-installed ESP-IDF environment"
+      echo "========================================"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      source /opt/esp/idf/export.sh
 
-      - name: Install ESP-IDF
-        uses: espressif/install-esp-idf-action@v1
-        with:
-          version: v5.5.4
+      echo
+      echo "ESP-IDF version:"
+      idf.py --version
 
-      - name: Set target
-        run: idf.py set-target esp32s3
+      echo
+      echo "========================================"
+      echo "Building ESP32-S3 firmware"
+      echo "========================================"
 
-      - name: Build
-        run: idf.py build
+      idf.py set-target esp32s3
+      idf.py build
 
-      - name: Validate and package flash artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 tools/package_firmware.py
+      echo
+      echo "========================================"
+      echo "Validating and packaging flash artifacts"
+      echo "========================================"
 
-      - name: Create official merged flash image
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          idf.py merge-bin -o artifacts/esp32s3_merged.bin
-          test -s artifacts/esp32s3_merged.bin
-          echo "Merged image:" 
-          ls -lh artifacts/esp32s3_merged.bin
+      python3 tools/package_firmware.py
 
-      - name: Publish firmware artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32s3-nat-router
-          path: artifacts/
-          if-no-files-found: error
+      echo
+      echo "========================================"
+      echo "Creating merged flash image"
+      echo "========================================"
+
+      mkdir -p artifacts
+
+      idf.py merge-bin \
+        -o artifacts/esp32s3_merged.bin
+
+      test -s artifacts/esp32s3_merged.bin
+
+      echo
+      echo "========================================"
+      echo "Final artifacts"
+      echo "========================================"
+
+      ls -lah artifacts/
+
+  - name: Upload firmware artifacts
+    uses: actions/upload-artifact@v4
+    with:
+      name: esp32s3-nat-router
+      path: artifacts/
+      if-no-files-found: error

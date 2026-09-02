@@ -253,7 +253,7 @@ static void wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     wifi_config_lock();
-    ESP_LOGI(TAG, "AP: %s / https://%s/", ap_ssid, DEFAULT_AP_IP);
+    ESP_LOGI(TAG, "AP: %s / http://%s/", ap_ssid, DEFAULT_AP_IP);
     wifi_config_unlock();
 }
 
@@ -328,16 +328,16 @@ void app_main(void)
     wifi_start();
     /* Confirm the OTA image as valid right after the core routing stack
      * (NVS + Wi-Fi driver + AP/STA) is up, and BEFORE starting the
-     * HTTPS/HTTP servers. A crash in the (non-critical) web server
+     * HTTP server. A crash in the (non-critical) web server
      * layer should not trigger a rollback of otherwise-good routing
      * firmware; confirming here means only a failure in the actual
      * routing-critical path can still cause one. */
     ota_confirm_running_image();
     if (!sta_ssid_configured()) captive_portal_start();
-    ESP_ERROR_CHECK(start_webserver(443) ? ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(start_webserver(80) ? ESP_OK : ESP_FAIL);
     ESP_LOGI(TAG, "ESP32-S3 NAT router ready");
     if (!wifi_config_admin_configured()) {
-        ESP_LOGW(TAG, "No admin credentials set yet - open https://%s/", DEFAULT_AP_IP);
+        ESP_LOGW(TAG, "No admin credentials set yet - open http://%s/", DEFAULT_AP_IP);
     }
     wifi_config_lock();
     bool ap_is_open = ap_passwd && ap_passwd[0] == '\0';
